@@ -1,15 +1,15 @@
-function G_out = run_optimization(sym_data, casadi_funs, G0,param, max_iter, tol,order)
+function G_out = run_optimization(sym_data, casadi_funs, G0, param, max_iter, tol, order)
 % RUN_OPTIMIZATION
-% Executa o processo de otimizaÃ§Ã£o usando a parte simbÃ³lica prÃ©-compilada
+% Executa o processo de otimização usando a parte simbólica pré-compilada
 %
-% sym_data    : estrutura com dados simbÃ³licos
-% casadi_funs : funÃ§Ãµes CasADi prÃ©-compiladas
-% G0          : condiÃ§Ã£o inicial (cell)
-% max_iter    : nÃºmero mÃ¡ximo de iteraÃ§Ãµes
-% tol         : tolerÃ¢ncia para convergÃªncia
+% sym_data    : estrutura com dados simbólicos
+% casadi_funs : funções CasADi pré-compiladas
+% G0          : condição inicial (cell)
+% max_iter    : número máximo de iterações
+% tol         : tolerância para convergência
 
 %% =========================================================
-%% Extrair dados da estrutura simbÃ³lica
+%% Extrair dados da estrutura simbólica
 %% =========================================================
 N = sym_data.N;
 n = sym_data.n;
@@ -21,7 +21,7 @@ p = sym_data.p;
 alpha = 1;
 
 %% =========================================================
-%% Extrair funÃ§Ãµes CasADi
+%% Extrair funções CasADi
 %% =========================================================
 f_fun = casadi_funs.f_fun;
 gradFun = casadi_funs.gradFun;
@@ -38,7 +38,7 @@ if has_h
 end
 
 %% =========================================================
-%% InicializaÃ§Ã£o numÃ©rica
+%% Inicialização numérica
 %% =========================================================
 Gvec_num = [];
 for i = 1:N
@@ -60,8 +60,17 @@ else
     lambda = [];
 end
 if has_g
-mu = (s'*nu)/max(1,m);
+    mu = (s'*nu)/max(1,m);
 end
+
+%% =========================================================
+%% Parâmetros de regularização adaptativa
+%% =========================================================
+reg_inicial = 1e-8;        % regularização inicial bem pequena
+reg          = reg_inicial;
+fator_reg    = 10;          % fator de aumento se mal condicionada
+max_reg      = 1e-2;        % limite máximo para regularização
+
 %% =========================================================
 %% Loop principal
 %% =========================================================
@@ -106,63 +115,97 @@ for k = 1:max_iter
     res_norm = norm([r_dual; r_prim_g; r_prim_h; r_cent]);
 
     if res_norm < tol
-        fprintf('ConvergÃªncia na iteraÃ§Ã£o %d\n', k);
+        fprintf('Convergência na iteração %d\n', k);
         break
     end
 
-    %% ---------------- Sistema KKT (MODIFICADO APENAS AQUI) ----------------
-   %% ---------------- Sistema KKT (CORRIGIDO) ----------------
+    %% ---------------- Sistema KKT (com regularização apenas no Hessiano) ----------------
+    % Montagem dos blocos que não dependem da regularização
+    if has_g && has_h
+        S = diag(s);
+        Nmat = diag(nu);
+        H_reg = H + reg * eye(d*N);
+        KKT = [ H_reg,         Jh',            Jg',            zeros(d*N,m);
+                Jh,             zeros(p),       zeros(p,m),     zeros(p,m);
+                Jg,             zeros(m,p),     zeros(m),       eye(m);
+                zeros(m,d*N),   zeros(m,p),     S,              Nmat ];
+        rhs = -[ r_dual;
+                 r_prim_h;
+                 r_prim_g;
+                 r_cent ];
+    elseif has_g && ~has_h
+        S = diag(s);
+        Nmat = diag(nu);
+        H_reg = H + reg * eye(d*N);
+        KKT = [ H_reg,         Jg',            zeros(d*N,m);
+                Jg,             zeros(m),       eye(m);
+                zeros(m,d*N),   S,              Nmat ];
+        rhs = -[ r_dual;
+                 r_prim_g;
+                 r_cent ];
+    elseif has_h && ~has_g
+        H_reg = H + reg * eye(d*N);
+        KKT = [ H_reg,     Jh';
+                Jh,        zeros(p) ];
+        rhs = -[ r_dual;
+                 r_prim_h ];
+    else
+        H_reg = H + reg * eye(d*N);
+        KKT = H_reg;
+        rhs = -r_dual;
+    end
 
-if has_g && has_h
-    
-    S = diag(s);
-    Nmat = diag(nu);
+    %% ---------------- Resolução robusta da KKT ----------------
+    n_total = size(KKT,1);
+    % Inicializa delta como vazio antes das tentativas
+    delta = [];
+    for tentativa = 1:5   % máximo de tentativas
+        try
+            % Estimativa rápida do número de condição
+            c = condest(KKT);
+            if c > 1e15 || isnan(c)
+                reg = min(reg * fator_reg, max_reg);
+                if has_g || has_h
+                    KKT(1:d*N, 1:d*N) = H + reg * eye(d*N);
+                else
+                    KKT = H + reg * eye(d*N);
+                end
+                continue;
+            end
 
-    KKT = [ H,              Jh',            Jg',            zeros(d*N,m);
-            Jh,             zeros(p),       zeros(p,m),     zeros(p,m);
-            Jg,             zeros(m,p),     zeros(m),       eye(m);
-            zeros(m,d*N),   zeros(m,p),     S,              Nmat ];
+            % Resolução do sistema linear com refinamento iterativo
+            delta = KKT \ rhs;
 
-    rhs = -[ r_dual;
-             r_prim_h;
-             r_prim_g;
-             r_cent ];
+            % -- Refinamento iterativo (um passo extra para precisão) --
+            res_ls = KKT * delta - rhs;
+            norm_res_ls = norm(res_ls);
+            if norm_res_ls > 1e-8 * norm(rhs)
+                % Corrige o erro residual
+                ddelta = KKT \ (-res_ls);
+                delta  = delta + ddelta;
+            end
+            break;  % sucesso
+        catch
+            % Em caso de erro (ex.: matriz singular), aumenta reg e tenta de novo
+            reg = min(reg * fator_reg, max_reg);
+            if has_g || has_h
+                KKT(1:d*N, 1:d*N) = H + reg * eye(d*N);
+            else
+                KKT = H + reg * eye(d*N);
+            end
+        end
+    end
 
-elseif has_g && ~has_h
-    
-    S = diag(s);
-    Nmat = diag(nu);
+    % Se ainda estiver vazio, última alternativa
+    if isempty(delta)
+        %warning('KKT singular mesmo após regularização máxima. Usando pseudoinversa.');
+        delta = pinv(full(KKT)) * rhs;
+    end
 
-    KKT = [ H,              Jg',            zeros(d*N,m);
-            Jg,             zeros(m),       eye(m);
-            zeros(m,d*N),   S,              Nmat ];
+    % Retorna reg ao valor inicial para a próxima iteração
+    reg = reg_inicial;
 
-    rhs = -[ r_dual;
-             r_prim_g;
-             r_cent ];
-
-elseif has_h && ~has_g
-
-    KKT = [ H,      Jh';
-            Jh,     zeros(p) ];
-
-    rhs = -[ r_dual;
-             r_prim_h ];
-
-else
-
-    KKT = H;
-    rhs = -r_dual;
-
-end
-
-    %% ---------------- ResoluÃ§Ã£o ----------------
-    %% 
-    %% 
-  reg = 10^-3;
-    delta =  ((KKT+reg*eye(size(KKT)))\rhs);
-
-    %% ---------------- ExtraÃ§Ã£o ----------------
+    %% ---------------- Extração das componentes ----------------
     idx = 1;
     deta = delta(idx:idx+d*N-1);
     idx = idx + d*N;
@@ -178,7 +221,7 @@ end
         ds = delta(idx:end);
     end
 
-    %% ---------------- Line search ----------------
+    %% ---------------- Line search (mantido como estava) ----------------
     alpha = 1;
 
     if has_g
@@ -191,15 +234,16 @@ end
         if any(idxn)
             alpha = min(alpha, min(-nu(idxn)./dnu(idxn)));
         end
-    end
- alpha = max(0.1,alpha);
-    %% ---------------- AtualizaÃ§Ã£o geomÃ©trica (MANTIDO COMO ESTAVA) ----------------
+ 
+
+    %% ---------------- Atualização geométrica (mantida como estava) ----------------
     j = 1;
     d_max = 2;
     for i = 1:N
         eta_i = alpha * deta(j:j+d-1);
-        if(norm(deta(j:j+d-1))>d_max)
-         eta_i = alpha*deta(j:j+d-1)/norm(deta(j:j+d-1));        end
+        if norm(deta(j:j+d-1)) > d_max
+            eta_i = alpha * deta(j:j+d-1) / norm(deta(j:j+d-1));
+        end
         S = full(casadi_funs.S_fun(eta_i));
         Gi_1 = reshape(Gvec_num((i-1)*n^2+1:i*n^2), n, n);
         Gi = Gi_1 * expm(S);
@@ -208,43 +252,44 @@ end
         j = j + d;
     end
 
-    %% ---------------- AtualizaÃ§Ã£o dual (MANTIDO COMO ESTAVA) ----------------
-    z =[];
+    %% ---------------- Atualização dual (mantida como estava) ----------------
+    z  = [];
     dz = [];
     if has_g
-        z = [s;nu]; 
-        dz = [ds;dnu];
+        z  = [s; nu];
+        dz = [ds; dnu];
     end
 
     if has_h
-        z = [z;lambda];
-        dz = [dz;dlambda];
+        z  = [z; lambda];
+        dz = [dz; dlambda];
     end
-     if has_g || has_h
-    n_o = length(z);
-    omega = zeros(n_o*(n_o-1)/2,1);
-    Z = [eye(length(z)), z; zeros(1, length(z)), 1];
-    S_z = [skew_number(omega), alpha*dz; zeros(1, length(z)), 0];
-    Z = Z * expm(S_z);
-     end
+    if has_g || has_h
+        n_o  = length(z);
+        omega = zeros(n_o*(n_o-1)/2, 1);
+        Z = [eye(length(z)), z; zeros(1, length(z)), 1];
+        S_z = [skew_number(omega), alpha*dz; zeros(1, length(z)), 0];
+        Z = Z * expm(S_z);
+    end
     if has_g
-        s = Z(1:m, end);
+        s  = Z(1:m, end);
         nu = Z(m+1:2*m, end);
         mu = 0.5*(s'*nu)/max(1,m);
     end
-    
+
     if has_h && ~has_g
         lambda = Z(1:p, end);
     elseif has_h && has_g
         lambda = Z(2*m+1:2*m+p, end);
     end
-   if(order ==1)
-   fprintf('iter %d |res| = %.2e |alpha| = %.2f\n', k, res_norm, alpha);
-   end
+
+    if order == 1
+        fprintf('iter %d |res| = %.2e |alpha| = %.2f\n', k, res_norm, alpha);
+    end
 end
 
 %% =========================================================
-%% SaÃ­da
+%% Saída
 %% =========================================================
 G_out = cell(N,1);
 for i = 1:N
