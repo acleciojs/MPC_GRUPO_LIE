@@ -1,0 +1,193 @@
+clc
+clear all
+import casadi.*
+% ParÃ¢metros fÃ­sicos do quadrotor
+    m = 2.24;       % Massa (kg)
+    l = 0.332;      % Comprimento do braÃ§o (m)
+    b = 9.5e-6;     % Empuxo de rotor (N/(rad/s)^2)
+    Kt = 1.7e-7;    % Constante de torque do motor (NÂ·m/(rad/s)^2)
+    G = 9.81;       % AceleraÃ§Ã£o devido Ã  gravidade (m/s^2)
+    Ixx = 0.0213;   % Momento de inÃ©rcia em torno do eixo x (kgÂ·m^2)
+    Iyy = 0.0363;   % Momento de inÃ©rcia em torno do eixo y (kgÂ·m^2)
+    Izz = 0.0615;   % Momento de inÃ©rcia em torno do eixo z (kgÂ·m^2)
+    I =diag([Ixx,Iyy,Izz]);
+    
+%% =========================================================
+% Horizonte
+%% =========================================================
+N  = 1;
+dt = 0.01;
+
+
+x_sym = SX.sym('x_sym',16);
+v = x_sym(1:3);
+a = x_sym(4:6);
+omega = x_sym(7:9);
+a_omega = x_sym(10:12);
+u = x_sym(13:end);
+S_3 = [0,-omega(3),omega(2);omega(3),0,-omega(1);-omega(2),omega(1),0];
+S_sym = [S_3,v,a,a_omega;zeros(4,6)]
+S_sym = [S_sym,[u;0;0;0]];
+
+omega_max = 1;
+omega_min = -1;
+v_max = 5;
+v_min = -5;
+p_max = [15;15;15];
+p_min = [-5;-5;-0.1];
+%% =========================================================
+% Variáveis de decisão
+%% =========================================================
+T_hor     = SX.sym('T',49,N+1);     % orientação (cos, sin)
+T0     = SX.sym('T0',49,1); 
+Q = diag([10,10,10,10,10,10,10,10,10]);
+R = diag([10,10,10,10]);
+%% =========================================================
+Rd= eye(3);
+
+ custo = 0;
+g = [];
+ Matriz_T = reshape(T_hor(:,1), 7, 7);
+ Matriz_T0 = reshape(T0, 7, 7);
+ H_1 = Matriz_T(1:6,1:6);
+ res0 =Matriz_T0(1:6,1:6)- H_1;
+ h = [res0(:)];
+ T_sym = cell(1,N+1);
+  T_par = cell(1,N+2);
+ T_par{1} = reshape(T0,7,7); 
+for k =1:N
+  Matriz_T = reshape(T_hor(:,k), 7, 7)    
+Matriz_Tnext = reshape(T_hor(:,k+1), 7, 7);  
+H_k = Matriz_T(1:6,1:6);
+H_k_next = Matriz_Tnext(1:6,1:6);
+u1_k = Matriz_T(1:4,6);
+omega_k = H_k(1:3,6);
+Rk = H_k(1:3,1:3);
+xi = H_k(1:3,4);
+S_3k = [0,-omega_k(3),omega_k(2);omega_k(3),0,-omega_k(1);-omega_k(2),omega_k(1),0];
+vk = H_k(1:3,5);
+xk =[xi;vk;omega_k];
+
+
+L = xk'*Q*xk+u1_k'*R*u1_k+norm(eye(3)-Rk*Rd,'fro');
+custo = custo+L;
+
+
+c = 0.018;
+u = [1,1,1,1;0,l,0,-l;-l,0,l,0;c,-c,c,-c]*[u1_k(1);u1_k(2);u1_k(3);u1_k(4)];
+T = [0;0;u(1)];
+ta = [u(2);u(3);u(4)];
+ay = [0;0;1];
+    % AceleraÃ§Ãµes lineares
+I3 = eye(3);
+ak = (-G*ay+(1/m)*Rk*T);
+a_omega_k = (-S_3k*I*omega_k+ta);
+Sk = [S_3k,Rk'*vk,Rk'*ak,Rk'*a_omega_k;zeros(3,6)];
+rest = H_k_next - H_k*(eye(6)+(dt*Sk));
+rest = rest(1:3,1:6);
+rest = rest(:);
+h = [h; rest(4:end)];
+g = [g;vk  - v_max;omega_k  - omega_max];
+g = [g;-vk  + v_min;-omega_k  + omega_min];
+g = [g;-xi+p_min];
+g = [g;xi-p_max];
+T_sym{k} =  Matriz_T;
+T_par{k+1} =  Matriz_T;
+end
+T_sym{k+1} = reshape(T_hor(:,k+1), 7, 7);
+T_par{k+2} = reshape(T_hor(:,k+1),7, 7);
+reshape(T_hor(:,k), 7, 7);
+
+[sym_data, casadi_funs] = solver_IPM(custo, T_sym,T0(:),S_sym,x_sym, g, h);
+
+
+
+%% =========================================================
+% Simulação em malha fechada (MPC)
+%% =========================================================
+Tsim = 1000; % número de passos
+p0 = [0.1;0.1;0.1];
+v0 = [0;0;0];
+omega0 = [0;0;0];
+u0 = [0;0;0;0];
+R0 = eye(3);
+T_0 = [R0,p0,v0,omega0;zeros(4,6)]
+T_0 = [T_0,[u0;0;0;0]] ;   
+
+% Estado inicial real
+T_real = full(T_0);
+
+% Chute inicial do horizonte
+T_guess = repmat(full(T_0(:)),1,N+1);
+
+% Armazenamento
+T_hist = zeros(16,Tsim);
+vf  =[];
+for t = 1:Tsim
+
+    fprintf('Tempo %d\n', t);
+
+    %% =====================================================
+    % Resolver MPC
+    %% =====================================================
+    G0 = cell(N+1,1);
+    for k = 1:N+1
+        G0{k} = reshape(T_guess(:,k),4,4);
+    end
+
+    G_opt = run_optimization( ...
+        sym_data, casadi_funs, G0, T_real(:), 200, 1e-2,0);
+
+    %% =====================================================
+    % Extrair solução ótima
+    %% =====================================================
+    T_opt = zeros(49,N+1);
+    for k = 1:N+1
+        var =G_opt{k}(:);
+        T_opt(:,k) =full( var);
+    end
+
+    %% =====================================================
+    % Aplicar primeiro controle (receding horizon)
+    %% =====================================================
+    T1 = reshape(T_opt(:,1),4,4);
+    T2 = reshape(T_opt(:,2),4,4);
+
+    % Extrair velocidades do modelo
+    vx = T1(1,4);
+    vy = T1(2,4);
+    omega = T1(3,4);
+  vf = [vf,vx];
+    %% =====================================================
+    % Modelo real (dinâmica)
+    %% =====================================================
+    S_real = [0,-omega,vx;
+              omega,0,vy;
+              0,0,0];
+
+    H_real = T_real(1:3,1:3);
+
+    % Integração (Euler)
+    H_next = H_real*expm(dt*S_real)
+     plot_robot_differential(H_next, 0.02);
+    % Atualizar estado completo
+    T_real(1:3,1:3) = H_next;
+    T_real(1,4) = vx;
+    T_real(2,4) = vy;
+    T_real(3,4) = omega;
+
+    %% =====================================================
+    % Armazenar
+    %% =====================================================
+    T_hist(:,t) = T_real(:);
+
+    %% =====================================================
+    % Shift do horizonte (warm start)
+    %% =====================================================
+    T_guess(:,1:N) = T_opt(:,2:N+1);
+    T_guess(:,N+1) = T_opt(:,N+1);
+
+    % IMPORTANTE: atualizar condição inicial
+    T_guess(:,1) = T_real(:);
+
+end
