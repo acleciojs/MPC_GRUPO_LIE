@@ -41,7 +41,7 @@ for r = 1:N
         S = skew_n(omega);   % deve retornar SX n×n
 
         % Variação exponencial (CasADi)
-        R_e = R * expm_casadi(S * e,30);
+        R_e = R * expm_casadi(S * e);
 
         % Substitui SOMENTE esta matriz em f
        

@@ -1,22 +1,37 @@
-function S = skew_n(x)
-% SKEW_N Gera uma matriz antissimétrica nxn (elemento de so(n))
+function S = skew_n(omega)
+% SKEW_N  Mapa so(n): vetor omega -> matriz antissimétrica S(omega)
 %
-%   S = skew_n(omega)
+% Entrada:
+%   omega : CasADi SX ou MX, tamanho n(n-1)/2
 %
-%   Entrada:
-%       omega - vetor coluna de tamanho n*(n-1)/2
-%
-%   Saída:
-%       S - matriz antissimétrica nxn (S = -S')
-%
-%   A dimensão n é inferida automaticamente de omega.
+% Saída:
+%   S : matriz nxn em so(n)
 
     import casadi.*
-%    v1 = x(1);
-%    v2 = x(2);
-%    omega = x(3);
-%    a1 = x(4);
-%    a2 = x(5);
-%    alpha = x(6);
-% 
-%    S = [0,-omega,v1,a1;omega,0,v2,a2;0,0,0,alpha;0,0,0,0];
+
+    omega = omega(:); % garante vetor coluna simbólico
+
+    m = length(omega);
+
+    % resolve n(n-1)/2 = m
+    n = (1 + sqrt(1 + 8*m)) / 2;
+
+    % checagem simbólica (vai funcionar em build-time)
+    if abs(double(n) - round(double(n))) > 1e-10
+        error('omega não tem dimensão compatível com so(n)');
+    end
+
+    n = round(n);
+
+    % matriz simbólica CasADi
+    S = SX.zeros(n,n);   % (pode trocar SX por MX se quiser)
+
+    k = 1;
+    for i = 1:n
+        for j = i+1:n
+            S(i,j) = omega(k);
+            S(j,i) = -omega(k);
+            k = k + 1;
+        end
+    end
+end

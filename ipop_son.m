@@ -136,7 +136,7 @@ for rep = 1:Nrep
     %% 1ï¸?âƒ£ EUCLIDIANO
     %% =====================================================
     tic;
-    R_euc = run_optimization_sqp(sym_euc, casadi_euc, R0, max_iter, tol);
+    R_euc = run_optimization(sym_euc, casadi_euc, R0, max_iter, tol);
     time_euc(rep) = toc;
     
     Rvec_euc = [];

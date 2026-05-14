@@ -5,11 +5,11 @@ import casadi.*
 %% =========================================================
 % Horizonte
 %% =========================================================
-N  = 10;
-dt = 0.01;
+N  = 5;
+dt = 0.08;
 
-v_min = -0.5;
-v_max =  0.5;
+v_min = -0.6;
+v_max =  0.6;
 x_sym = SX.sym('x_sym',6);
    v1 = x_sym(1);
    v2 = x_sym(2);
@@ -19,8 +19,8 @@ x_sym = SX.sym('x_sym',6);
    alpha = x_sym(6);
 
 S_sym = [0,-omega,v1,a1;omega,0,v2,a2;0,0,0,alpha;0,0,0,0];
-omega_min = -1;
-omega_max =  1;
+omega_min = -0.8;
+omega_max =  0.8;
 
 %% =========================================================
 % Variáveis de decisão
@@ -41,7 +41,7 @@ p_0 = [0; 0];
 v_0 = [0; 0];
 omega_0 = 0;
 R_ref = [cos(theta_ref); sin(theta_ref)];
-p_ref = [5; 5];
+p_ref = [6; 5];
 
 v_ref     = [0.0; 0.0];
 omega_ref = 0;
@@ -60,7 +60,7 @@ T_ref = [R_ref(1), -R_ref(2), p_ref(1),v_ref(1);
         0,        0,    0,           1 ];
 
  custo = 0;
- Q =diag([30,30]);
+ Q =diag([2,2]);
  R = diag([1,1,1]);
  g = [];
  p_max = 9;
@@ -136,7 +136,7 @@ for t = 1:Tsim
     end
 
     G_opt = run_optimization( ...
-        sym_data, casadi_funs, G0, T_real(:), 200, 1e-2,0);
+        sym_data, casadi_funs, G0, T_real(:), 200, 1e-5,1);
 
     %% =====================================================
     % Extrair solução ótima
@@ -154,11 +154,10 @@ for t = 1:Tsim
     T2 = reshape(T_opt(:,2),4,4);
 
     % Extrair velocidades do modelo
-    vx = T1(1,4);
-    vy = T1(2,4);
-    omega = T1(3,4);
-  vf = [vf,vx];
-    %% =====================================================
+    vx = T1(1,4)
+    vy = T1(2,4)
+    omega = T1(3,4)
+     %% =====================================================
     % Modelo real (dinâmica)
     %% =====================================================
     S_real = [0,-omega,vx;
@@ -169,7 +168,7 @@ for t = 1:Tsim
 
     % Integração (Euler)
     H_next = H_real*expm(dt*S_real)
-     plot_robot_differential(H_next, 0.02);
+   %  plot_robot_differential(H_next, dt);
     % Atualizar estado completo
     T_real(1:3,1:3) = H_next;
     T_real(1,4) = vx;

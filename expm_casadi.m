@@ -1,4 +1,4 @@
-function R = expm_casadi_fast(S)
+function R = expm_casadi(S)
 % EXPM_CASADI_FAST
 % Versão otimizada para velocidade no CasADi
 % Padé (13,13) + scaling fixo
