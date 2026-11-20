@@ -1,22 +1,11 @@
-function S = skew_n(x)
-% SKEW_N Gera uma matriz antissimétrica nxn (elemento de so(n))
-%
-%   S = skew_n(omega)
-%
-%   Entrada:
-%       omega - vetor coluna de tamanho n*(n-1)/2
-%
-%   Saída:
-%       S - matriz antissimétrica nxn (S = -S')
-%
-%   A dimensão n é inferida automaticamente de omega.
-
+function S = skew_n(omega)
+    % Generic skew-symmetric matrix builder for so(n)
+    % omega: vector of length n*(n-1)/2
+    % Returns: n x n skew-symmetric matrix
+    
     import casadi.*
-%    v1 = x(1);
-%    v2 = x(2);
-%    omega = x(3);
-%    a1 = x(4);
-%    a2 = x(5);
-%    alpha = x(6);
-% 
-%    S = [0,-omega,v1,a1;omega,0,v2,a2;0,0,0,alpha;0,0,0,0];
+    
+   S = [0,-omega(3),omega(2);omega(3),0,-omega(1);-omega(2),omega(1),0];
+
+
+end

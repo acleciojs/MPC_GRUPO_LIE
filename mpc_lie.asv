@@ -1,3 +1,4 @@
+
 clc
 clear all
 import casadi.*
@@ -5,11 +6,11 @@ import casadi.*
 %% =========================================================
 % Horizonte
 %% =========================================================
-N  = 3;
+N  =5;
 dt = 0.01;
 
-v_min = -0.05;
-v_max =  0.05;
+v_min = -0.5;
+v_max =  0.5;
 x_sym = SX.sym('x_sym',6);
    v1 = x_sym(1);
    v2 = x_sym(2);
@@ -19,8 +20,8 @@ x_sym = SX.sym('x_sym',6);
    alpha = x_sym(6);
 
 S_sym = [0,-omega,v1,a1;omega,0,v2,a2;0,0,0,alpha;0,0,0,0];
-omega_min = -0.5;
-omega_max =  0.5;
+omega_min = -1;
+omega_max =  1;
 
 %% =========================================================
 % Variáveis de decisão
@@ -41,7 +42,7 @@ p_0 = [0; 0];
 v_0 = [0; 0];
 omega_0 = 0;
 R_ref = [cos(theta_ref); sin(theta_ref)];
-p_ref = [0.1; 0.1];
+p_ref = [5; 5];
 
 v_ref     = [0.0; 0.0];
 omega_ref = 0;
@@ -63,8 +64,8 @@ T_ref = [R_ref(1), -R_ref(2), p_ref(1),v_ref(1);
  Q =diag([30,30]);
  R = diag([1,1,1]);
  g = [];
- p_max = 0.15;
- p_min = -0.1;
+ p_max = 9;
+ p_min = -3;
   Matriz_T = reshape(T_hor(:,1), 4, 4);
   Matriz_T0 = reshape(T0, 4, 4);
   H_1 = Matriz_T(1:3,1:3);
@@ -88,10 +89,12 @@ omega_k =Matriz_T(3,4);
 vx_k =Matriz_T(1,4); 
 vy_k =Matriz_T(2,4); 
 px_k =Matriz_T(1,3); 
-py_k =Matriz_T(2,3)
+py_k =Matriz_T(2,3);
 Sk = [0,-omega_k,vx_k;omega_k,0,vy_k;0,0,0];
 rest = H_k_next - H_k*(eye(3)+(dt*Sk));
-h = [h; rest(4:)];
+rest = rest(1:2,1:3);
+rest = rest(:);
+h = [h; rest(3:end)];
 g = [g;vx_k  - v_max; vy_k  - v_max;omega_k  - omega_max];
 g = [g;-vx_k  + v_min; -vy_k  + v_min;omega_k  + omega_min];
 g = [g;-px_k  + p_min; -py_k  + p_min];
@@ -110,7 +113,7 @@ reshape(T_hor(:,k), 4, 4);
 %% =========================================================
 % Simulação em malha fechada (MPC)
 %% =========================================================
-Tsim = 4000; % número de passos
+Tsim = 2000; % número de passos
 
 % Estado inicial real
 T_real = full(T_0);
@@ -120,9 +123,9 @@ T_guess = repmat(full(T_0(:)),1,N+1);
 
 % Armazenamento
 T_hist = zeros(16,Tsim);
-
+vf  =[];
 for t = 1:Tsim
-
+tic
     fprintf('Tempo %d\n', t);
 
     %% =====================================================
@@ -134,7 +137,7 @@ for t = 1:Tsim
     end
 
     G_opt = run_optimization( ...
-        sym_data, casadi_funs, G0, T_real(:), 200, 1e-9,0);
+        sym_data, casadi_funs, G0, T_real(:), 200, 1e-3,1, 1e-5);
 
     %% =====================================================
     % Extrair solução ótima
@@ -152,10 +155,10 @@ for t = 1:Tsim
     T2 = reshape(T_opt(:,2),4,4);
 
     % Extrair velocidades do modelo
-    vx = T1(1,4)
-    vy = T1(2,4)
-    omega = T1(3,4)
-
+    vx = T1(1,4);
+    vy = T1(2,4);
+    omega = T1(3,4);
+  vf = [vf,vx];
     %% =====================================================
     % Modelo real (dinâmica)
     %% =====================================================
@@ -167,7 +170,7 @@ for t = 1:Tsim
 
     % Integração (Euler)
     H_next = H_real*expm(dt*S_real)
-
+     plot_robot_differential(H_next, 0.02);
     % Atualizar estado completo
     T_real(1:3,1:3) = H_next;
     T_real(1,4) = vx;
@@ -187,5 +190,6 @@ for t = 1:Tsim
 
     % IMPORTANTE: atualizar condição inicial
     T_guess(:,1) = T_real(:);
+    toc
 
 end

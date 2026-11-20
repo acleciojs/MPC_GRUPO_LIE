@@ -1,0 +1,388 @@
+function out = nmpc_multirotor_usando_sqp_lie_admm(cfg)
+% NMPC_MULTIROTOR_USANDO_SQP_LIE_ADMM
+% Controle em MALHA FECHADA com a planta IntegrationEuler original.
+%
+% Em cada amostra t:
+%  1) construir warm start MPC e primal-dual ADMM a partir da
+%     trajetoria PRIMAL otimizada na amostra anterior, deslocada um passo;
+%  2) resolver a SQP geometrica + ADMM, com T_global e S_global;
+%  3) aplicar SOMENTE o primeiro controle u_opt(:,1);
+%  4) evoluir a planta por IntegrationEuler(x_real,u_aplicado,dt);
+%  5) deslocar Xopt e Uopt para a proxima amostra.
+%
+% Warm start ADMM: z, w geometricamente recentrados para base nova;
+% multiplicadores NAO escalados transportados e deslocados no horizonte.
+% Inicio frio apenas na primeira amostra ou sem cache valido.
+% As QPs locais usam qpOASES ou ProxQP via CasADi, sem quadprog.
+%
+% Configuracoes:
+% cfg.T_sim           = 30 por padrao; 100 -> um segundo se dt=0.01
+% cfg.warm_start      = true (trajetorias primais do MPC)
+% cfg.warm_state_mode = 'shift' (desloca Xpred e Upred de fato)
+%                       'rollout' (integra Xnom com Ushift usando planta)
+% cfg.admm_warm_start = true (novo; seed ADMM entre SQP e MPC)
+% cfg.admm_warm_dual_damping = 0.95 (0..1)
+% cfg.admm_warm_primal_damping = 1 (0..1)
+% cfg.admm_warm_primal_max_inf = 0.5
+% cfg.admm_warm_local_qp = true
+% cfg.plot_results    = true por padrao
+%
+% ATENCAO: em 'shift' o chute pode ter defeitos dinamicos residuais se
+% a SQP anterior ainda estiver inexata. A SQP lineariza esses defeitos;
+% para um chute dinamicamente viavel escolha 'rollout'.
+%
+% Dependencias do usuario: Init, Equilibrio, IntegrationEuler,
+% Attitude_error e CasADi. Nao ha projecao do estado da planta.
+clc
+close all
+clear all
+if nargin<1 || isempty(cfg), cfg=struct(); end
+assert(isstruct(cfg),'cfg deve ser struct');
+if isfield(cfg,'casadi_path') && ~isempty(cfg.casadi_path)
+    assert(exist(cfg.casadi_path,'dir')~=0,'casadi_path nao encontrado');
+    addpath(cfg.casadi_path);
+end
+
+required={'Init','Equilibrio','IntegrationEuler','Attitude_error', ...
+    'sqp_lie_admm','resolver_admm_qps','passo_exponencial_sqp', ...
+    'gerar_derivadas_nmpc_multirotor','preparar_warm_admm'};
+for j=1:numel(required)
+    assert(exist(required{j},'file')~=0, ...
+        'Dependencia ausente no path MATLAB: %s',required{j});
+end
+
+% Construir derivadas GLOBALMENTE uma unica vez, antes da malha fechada.
+prob=gerar_derivadas_nmpc_multirotor(cfg);
+N=prob.N;nu=prob.nu;nt=prob.nt;na=prob.na;
+T_sim=read_cfg(cfg,'T_sim',5000);
+assert(isscalar(T_sim) && T_sim>=1 && T_sim==floor(T_sim), ...
+    'T_sim deve ser inteiro positivo');
+
+warm_enabled=logical(read_cfg(cfg,'warm_start',true));
+warm_mode=lower(char(read_cfg(cfg,'warm_state_mode','shift')));
+assert(ismember(warm_mode,{'shift','rollout'}), ...
+    'warm_state_mode deve ser shift ou rollout');
+
+opts=struct();
+opts.max_sqp=read_cfg(cfg,'max_sqp',1);
+opts.admm_warm_start=logical(read_cfg(cfg,'admm_warm_start',true));
+opts.admm_warm_dual_damping=read_cfg(cfg,'admm_warm_dual_damping',0.95);
+opts.admm_warm_primal_damping=read_cfg(cfg,'admm_warm_primal_damping',1.0);
+opts.admm_warm_primal_max_inf=read_cfg(cfg,'admm_warm_primal_max_inf',0.8);
+opts.admm_warm_local_qp=logical(read_cfg(cfg,'admm_warm_local_qp',true));
+opts.admm_seed=[];
+opts.rho=read_cfg(cfg,'rho',20000);
+opts.precond_mode=read_cfg(cfg,'precond_mode','scalar');
+opts.precond_power=read_cfg(cfg,'precond_power',0.98);
+opts.precond_clamp=read_cfg(cfg,'precond_clamp',[0.2 5]);
+opts.precond_weights=read_cfg(cfg,'precond_weights',[]);
+opts.max_admm=read_cfg(cfg,'max_admm',2500);
+opts.tol_abs=read_cfg(cfg,'tol_abs',1e-2);
+opts.tol_rel=read_cfg(cfg,'tol_rel',1e-2);
+opts.tol_gap_inf=read_cfg(cfg,'tol_gap_inf',1e-2);
+opts.tol_eq_lin=read_cfg(cfg,'tol_eq_lin',1e-2);
+opts.tol_ineq_lin=read_cfg(cfg,'tol_ineq_lin',1e-2);
+opts.reg_base=read_cfg(cfg,'hessian_reg_base',1e-6);
+opts.reg_floor=read_cfg(cfg,'hessian_reg_floor',1e-8);
+% Tolerancias de verificacao da QP local (sem quadprog)
+opts.qp_constraint_tolerance=read_cfg(cfg,'qp_constraint_tolerance',1e-6);
+opts.qp_optimality_tolerance=read_cfg(cfg,'qp_optimality_tolerance',1e-7);
+opts.qp_max_iterations=read_cfg(cfg,'qp_max_iterations',800);
+opts.qp_local_eq_tol=read_cfg(cfg,'qp_local_eq_tol',1e-5);
+opts.qp_local_ineq_tol=read_cfg(cfg,'qp_local_ineq_tol',1e-6);
+opts.qp_solver=read_cfg(cfg,'qp_solver','qpoases');
+opts.qp_restart_on_failure=logical(read_cfg(cfg,'qp_restart_on_failure',true));
+opts.compare_central=logical(read_cfg(cfg,'compare_central',false));
+opts.verbose=logical(read_cfg(cfg,'verbose',true));
+opts.verbose_admm=logical(read_cfg(cfg,'verbose_admm',true));
+opts.verbose_every=read_cfg(cfg,'verbose_every',100);
+opts.verificar_jacobianas=logical(read_cfg(cfg,'verificar_jacobianas',false));
+opts.compiled_fun=prob.fn;
+
+% Estado da PLANTA: nunca substitui-lo por um estado previsto pela SQP.
+x_real=prob.xinit(:);
+U_init=read_cfg(cfg,'U0',repmat(prob.u_hover,1,N));
+assert(isequal(size(U_init),[nu,N]),'U0 deve ter tamanho 8 x N');
+assert(all(U_init(:)>=repmat(prob.u_min,N,1)-1e-8) && ...
+       all(U_init(:)<=repmat(prob.u_max,N,1)+1e-8), ...
+       'U0 fora dos limites fisicos');
+
+% Historico fisico (somente a planta) e predicoes MPC.
+X_real_hist=nan(na,T_sim+1);X_real_hist(:,1)=x_real;
+U_aplicado_hist=nan(nu,T_sim);
+err=nan(1,T_sim+1);err(1)=norm(x_real(1:3)-prob.xref(1:3));
+F_hist=nan(1,T_sim);
+admm_iters=nan(1,T_sim);gap=nan(1,T_sim);
+qp_eq=nan(1,T_sim);qp_ineq=nan(1,T_sim);
+def_pred=nan(1,T_sim);def_warm=nan(1,T_sim);
+err_primeiro_no=nan(1,T_sim);warm_used=false(1,T_sim);
+admm_warm_used=false(1,T_sim);admm_warm_source=cell(1,T_sim);
+admm_warm_primal_inf=nan(1,T_sim);admm_warm_dual_inf=nan(1,T_sim);
+Xpred_hist=cell(T_sim,1);Upred_hist=cell(T_sim,1);
+Xwarm_hist=cell(T_sim,1);Uwarm_hist=cell(T_sim,1);
+sqp_log=cell(T_sim,1);
+
+cache=struct('X',[],'U',[],'admm',[],'admm_base',[]);
+% O dual nao depende da escala P: armazenar gamma NAO ESCALADO.
+% A base de linearizacao da ultima QP SQP e indispensavel para transportar
+% corretamente o multiplicador de SO(3).
+completed=0;status='ok';message='';
+
+for t=1:T_sim
+    tic
+    % A primeira amostra e a ausencia de warm usam o equilibrio e rollout.
+    % Nas demais, deslocar o horizonte OTIMIZADO da amostra anterior.
+    if warm_enabled && ~isempty(cache.U)
+        [Xnom,Unom]=deslocar_warm_start_mpc( ...
+            cache.X,cache.U,x_real,prob.model_fun,warm_mode);
+        warm_used(t)=true;
+    else
+        Unom=U_init;
+        Xnom=rollout_IntegrationEuler(prob.model_fun,x_real,Unom);
+    end
+
+    assert(isequal(size(Xnom),[na N+1]) && ...
+           isequal(size(Unom),[nu N]), ...
+           'Dimensoes do warm start invalidas');
+    assert(norm(Xnom(:,1)-x_real,inf)<1e-12, ...
+           'O primeiro estado do MPC deve ser a medicao da planta');
+    for k=1:N+1
+        verificar_grupos(Xnom(:,k),1e-5);
+    end
+
+    % Guardar o chute de fato utilizado para diagnosticar o warm start.
+    Xwarm_hist{t}=Xnom;Uwarm_hist{t}=Unom;
+    def_warm(t)=defeito_integracao(prob.model_fun,Xnom,Unom);
+    err_primeiro_no(t)=norm(Xnom(:,1)-x_real,inf);
+
+    % Variaveis base, na mesma ordem da derivacao com T_GLOBAL/S_GLOBAL.
+    base=[Xnom(:);Unom(:)];
+
+    % Condicao inicial: o incremento tangente do estado medido e zero.
+    opts.lb_delta=-inf(prob.nd,1);
+    opts.ub_delta= inf(prob.nd,1);
+    opts.lb_delta(1:nt)=0;
+    opts.ub_delta(1:nt)=0;
+    % Limites fisicos das entradas (em incrementos, sem controle terminal).
+    for k=1:N
+        id=nt*(N+1)+(k-1)*nu+(1:nu);
+        opts.lb_delta(id)=prob.u_min-Unom(:,k);
+        opts.ub_delta(id)=prob.u_max-Unom(:,k);
+    end
+
+    % Warm ADMM da amostra anterior. O primal e RECENTRADO a partir da
+    % trajetoria fisica prevista, nunca aplica novamente o ultimo delta.
+    opts.admm_seed=[];
+    if opts.admm_warm_start && warm_enabled && warm_used(t) && ...
+            ~isempty(cache.admm) && cache.admm.converged && ...
+            ~isempty(cache.admm_base)
+        old_base_X=reshape(cache.admm_base(1:na*(N+1)),na,N+1);
+        [Xtarget,Utarget]=deslocar_warm_start_mpc( ...
+            cache.X,cache.U,x_real,prob.model_fun,'shift');
+        try
+            opts.admm_seed=preparar_warm_admm(cache.admm, ...
+                old_base_X,Xnom,Xtarget,Unom,Utarget, ...
+                prob.indices_blocos,prob.bs,1,opts);
+        catch ME
+            warning('Warm ADMM MPC descartado em t=%d: %s',t,ME.message);
+            opts.admm_seed=[];
+        end
+    end
+    if ~isempty(opts.admm_seed)
+        admm_warm_source{t}=opts.admm_seed.source;
+        admm_warm_primal_inf(t)=opts.admm_seed.primal_inf;
+        admm_warm_dual_inf(t)=opts.admm_seed.dual_inf;
+    else
+        admm_warm_source{t}='cold';
+    end
+    sqp=sqp_lie_admm(prob.f_sym,prob.H_sym,prob.g_sym,prob.Jg_sym, ...
+        prob.h_sym,prob.Jh_sym,prob.delta_sym,prob.X_sym, ...
+        base,prob.indices_blocos,prob.exp_cfg,opts);
+    sqp_log{t}=sqp;
+    if ~isempty(sqp.sqp)
+        admm_warm_used(t)=sqp.sqp(1).admm.warm_used;
+    end
+    if sqp.completed_sqp<1
+        status=sqp.status;message=sqp.message;
+        warning('MPC parou em t=%d: %s',t,message);
+        break;
+    end
+
+    % O valor otimizado e um HORIZONTE. A planta nao salta para Xopt(:,2).
+    Xopt=reshape(sqp.x(1:na*(N+1)),na,N+1);
+    Uopt=reshape(sqp.x(na*(N+1)+1:end),nu,N);
+    u_aplicar=Uopt(:,1);        % SOMENTE a primeira acao!
+
+    if any(~isfinite(u_aplicar)) || ...
+            any(u_aplicar<prob.u_min-1e-6) || ...
+            any(u_aplicar>prob.u_max+1e-6)
+        status='controle_invalido';
+        message=sprintf('Primeiro controle fora dos limites em t=%d',t);
+        warning('%s',message);break;
+    end
+
+    % Diagnostico: defeito do horizonte otimizado ANTES da planta.
+    def_pred(t)=defeito_integracao(prob.model_fun,Xopt,Uopt);
+    qp_eq(t)=sqp.sqp(end).resid_eq;
+    qp_ineq(t)=sqp.sqp(end).viol_ineq;
+    admm_iters(t)=sqp.sqp(end).admm.iter;
+    gap(t)=sqp.sqp(end).admm.gap_inf;
+    F_hist(t)=sqp.f_final;
+    Xpred_hist{t}=Xopt;Upred_hist{t}=Uopt;
+
+    % =============== PLANTA EM MALHA FECHADA =================
+    % prob.model_fun foi construido por:
+    % Function(...,{x,u},{IntegrationEuler(x,u,prob.dt)}).
+    % Assim, a planta real usa EXATAMENTE IntegrationEuler, sem projecao.
+    x_proximo=passo_planta_IntegrationEuler(prob.model_fun,x_real,u_aplicar);
+    verificar_grupos(x_proximo,1e-5);
+
+    U_aplicado_hist(:,t)=u_aplicar;
+    X_real_hist(:,t+1)=x_proximo;
+    err(t+1)=norm(x_proximo(1:3)-prob.xref(1:3));
+    completed=t;
+
+    % Guardar MPC e cache primal-dual ADMM para a proxima amostra.
+    % Os incrementos locais serao RECENTRADOS; nunca deslocados cruamente.
+    cache.X=Xopt;
+    cache.U=Uopt;
+    cache.admm=sqp.admm_final;
+    cache.admm_base=sqp.admm_base;
+    x_real=x_proximo;
+   disp('pos:')
+   disp(x_proximo(1:3))
+    fprintf(['MPC t=%d/%d | SQP=%d | ADMM=%d | warm=%d (%s) | ' ...
+        'warm_ADMM=%d | gap=%.3e | eq_lin=%.3e | def_warm=%.3e | ' ...
+        'def_pred=%.3e | err_pos=%.3e | u1=%.3e\n'], ...
+        t,T_sim,sqp.completed_sqp,admm_iters(t),warm_used(t),warm_mode, ...
+        admm_warm_used(t),gap(t),qp_eq(t),def_warm(t),def_pred(t),err(t+1),norm(u_aplicar,inf));
+    toc
+end
+
+out=struct();
+out.status=status;out.message=message;
+out.completed_steps=completed;
+out.dt=prob.dt;out.N=N;out.M=prob.M;
+out.p_ref=prob.xref(1:3);
+out.x=X_real_hist(:,1:completed+1);
+out.u=U_aplicado_hist(:,1:completed);
+out.err=err(1:completed+1);
+out.f=F_hist(1:completed);
+out.admm_iters=admm_iters(1:completed);
+out.gap=gap(1:completed);
+out.eq_lin=qp_eq(1:completed);
+out.ineq_lin=qp_ineq(1:completed);
+out.def_pred=def_pred(1:completed);
+out.def_warm=def_warm(1:completed);
+out.warm_used=warm_used(1:completed);
+out.admm_warm_used=admm_warm_used(1:completed);
+out.admm_warm_source=admm_warm_source(1:completed);
+out.admm_warm_primal_inf=admm_warm_primal_inf(1:completed);
+out.admm_warm_dual_inf=admm_warm_dual_inf(1:completed);
+out.warm_first_node_error=err_primeiro_no(1:completed);
+out.Xpred=Xpred_hist(1:completed);
+out.Upred=Upred_hist(1:completed);
+out.Xwarm=Xwarm_hist(1:completed);
+out.Uwarm=Uwarm_hist(1:completed);
+out.sqp=sqp_log(1:completed);
+out.failed_sqp=[];
+if completed<T_sim, out.failed_sqp=sqp_log{completed+1}; end
+out.warm_state_mode=warm_mode;
+out.warm_start=warm_enabled;
+out.admm_warm_start=opts.admm_warm_start;
+out.admm_cache_final=cache.admm;
+out.integrator='IntegrationEuler';
+out.derivadas=struct('n_delta',prob.nd,'n_f',1,'n_g',20*N, ...
+    'n_h',42*N,'backend',prob.derivative_backend,'n_group',prob.n_group);
+if logical(read_cfg(cfg,'plot_results',true)) && completed>0
+    plotar_malha_fechada(out);
+end
+end
+
+function [X,U]=deslocar_warm_start_mpc(Xanterior,Uanterior,x_real, ...
+                                        model_fun,mode)
+% Somente warm PRIMAL do NMPC: shift de controles e de estados otimizados.
+[na,K]=size(Xanterior);N=K-1;
+assert(na==30 && size(Uanterior,2)==N,'Cache MPC incompatível');
+U=[Uanterior(:,2:end),Uanterior(:,end)];
+if strcmp(mode,'rollout')
+    % Warm em controles e estados NOMINAIS consistentes com IntegrationEuler.
+    X=rollout_IntegrationEuler(model_fun,x_real,U);
+    return;
+end
+% shift: preserva as coordenadas de TODOS os nos otimizados que restaram.
+X=zeros(na,N+1);
+X(:,1)=x_real;
+if N>1
+    X(:,2:N)=Xanterior(:,3:N+1);
+end
+% Ultimo no, ainda nao previsto no horizonte anterior: prolongar com
+% IntegrationEuler e ultimo controle do MPC anterior.
+X(:,N+1)=passo_planta_IntegrationEuler(model_fun,X(:,N),U(:,N));
+end
+
+function X=rollout_IntegrationEuler(model_fun,x0,U)
+% A mesma IntegrationEuler aparece na predicao e na planta.
+N=size(U,2);X=zeros(numel(x0),N+1);X(:,1)=x0(:);
+for k=1:N
+    X(:,k+1)=passo_planta_IntegrationEuler(model_fun,X(:,k),U(:,k));
+end
+end
+
+function xn=passo_planta_IntegrationEuler(model_fun,x,u)
+% Executa o Function CasADi cujo grafo e IntegrationEuler(x,u,dt).
+% Nao utiliza a previsao otimizada como planta e nao projeta a rotacao.
+xn=full(model_fun(x(:),u(:)));xn=xn(:);
+assert(numel(xn)==30 && all(isfinite(xn)), ...
+    'IntegrationEuler retornou estado invalido');
+end
+
+function defect=defeito_integracao(model_fun,X,U)
+N=size(U,2);defect=0;
+for k=1:N
+    xn=passo_planta_IntegrationEuler(model_fun,X(:,k),U(:,k));
+    defect=max(defect,norm(xn-X(:,k+1),inf));
+end
+end
+
+function verificar_grupos(x,tol)
+R=reshape(x(14:22),3,3);
+so3=max(norm(R.'*R-eye(3),'fro'),abs(det(R)-1));
+q=x(23:2:29).^2+x(24:2:30).^2;
+so2=max(abs(q-1));
+if max(so3,so2)>tol
+    error(['IntegrationEuler/Init nao preserva SO(3) x SO(2)^4: ' ...
+        'erro_SO3=%.2e e erro_SO2=%.2e. A planta foi mantida sem ' ...
+        'projecao por solicitacao; ajuste IntegrationEuler para ' ...
+        'integrar as rotacoes no grupo.'],so3,so2);
+end
+end
+
+function plotar_malha_fechada(out)
+n=out.completed_steps;t=(0:n)*out.dt;tu=(0:n-1)*out.dt;
+figure('Name','NMPC multirrotor: planta IntegrationEuler');
+subplot(3,1,1);
+plot(t,out.x(1:3,:).','LineWidth',1.3);hold on;
+plot(t,repmat(out.p_ref(:).',n+1,1),'--','LineWidth',0.9);
+ylabel('Posicao (m)');grid on;
+legend('x','y','z','x ref','y ref','z ref','Location','best');
+subplot(3,1,2);
+plot(t,out.err,'LineWidth',1.5);grid on;
+ylabel('||p-p_{ref}||_2');
+subplot(3,1,3);
+stairs(tu,out.u.','LineWidth',1.0);grid on;
+ylabel('Entradas aplicadas');xlabel('Tempo (s)');
+figure('Name','Convergencia SQP-ADMM em malha fechada');
+subplot(3,1,1);stairs(tu,out.admm_iters,'LineWidth',1.2);
+grid on;ylabel('Iter. ADMM');
+subplot(3,1,2);semilogy(tu,max(out.gap,eps),'LineWidth',1.2);
+grid on;ylabel('Gap consenso');
+subplot(3,1,3);semilogy(tu,max(out.def_pred,eps),'LineWidth',1.2);hold on;
+semilogy(tu,max(out.def_warm,eps),'--','LineWidth',1.2);
+grid on;ylabel('Defeito dinamico');xlabel('Tempo (s)');
+legend('Horizonte otimo','Chute warm','Location','best');
+end
+
+function v=read_cfg(c,k,def)
+if isfield(c,k) && ~isempty(c.(k)),v=c.(k);else,v=def;end
+end
