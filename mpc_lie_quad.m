@@ -25,7 +25,6 @@ dt = 0.01;
 % Variáveis simbólicas
 %% =========================================================
 x_sym = SX.sym('x_sym',16);
-x_sym = SX.sym('x_sym',16); 
 v = x_sym(1:3); 
 a = x_sym(4:6); 
 omega = x_sym(7:9);
@@ -46,7 +45,7 @@ T_hor = SX.sym('T',49,N+1);
 T0    = SX.sym('T0',49,1);
 
 Q = diag([50,50,50,1,1,1,1,1,1]);
-R = diag([0.1,0.1,0.1,0.1]);
+R = diag([0.01,0.01,0.01,0.01]);
 
 Rd = eye(3);
 
@@ -57,7 +56,7 @@ h = [];
 %% =========================================================
 % Restrição inicial
 %% =========================================================
-T_init = reshape(T_hor(:,1),7,7);
+T_init = reshape(T_hor(:,0),7,7);
 T0_mat = reshape(T0,7,7);
 p_ref = [3;3;3];
 res0 = T0_mat(1:6,1:6) - T_init(1:6,1:6);
@@ -79,7 +78,7 @@ for k = 1:N
     vk      = H_k(1:3,5);
     omega_k = H_k(1:3,6);
 
-    u1_k = T_k(1:4,6);
+    u1_k = T_k(1:4,7);
 
     S_3k = [0,-omega_k(3),omega_k(2);
             omega_k(3),0,-omega_k(1);
@@ -89,7 +88,7 @@ for k = 1:N
 
     %% custo
     u0 = [5.49;5.49;5.49;5.49];
-    L = xk'*Q*xk + (u1_k- u0)'*R*(u1_k- u0) + norm(eye(3)-Rk*Rd,'fro')^2;
+    L = xk'*Q*xk + (u1_k- u0)'*R*(u1_k- u0) + norm(eye(3)-Rk'*Rd,'fro')^2;
     custo = custo + L;
 
     %% dinâmica
@@ -104,7 +103,7 @@ for k = 1:N
     ay = [0;0;1];
 
     ak = (-G*ay + (1/m)*Rk*T_force);
-    a_omega_k = (-S_3k*I*omega_k + ta);
+    a_omega_k = inv(I)*(-S_3k*I*omega_k + ta);
 
     Sk = [S_3k, Rk'*vk, Rk'*ak, Rk'*a_omega_k;
           zeros(3,6)];
@@ -166,7 +165,7 @@ for t = 1:Tsim
         G0{k} = reshape(T_guess(:,k),7,7);
     end
 
-    G_opt = run_optimization(sym_data, casadi_funs, G0, T_real(:), 200, 1e-2, 0);
+    G_opt = run_optimization(sym_data, casadi_funs, G0, T_real(:), 200, 1e-2, 1);
 
     %% solução
     T_opt = zeros(49,N+1);
@@ -203,7 +202,7 @@ for t = 1:Tsim
     ay = [0;0;1];
 
     ak = (-G*ay + (1/m)*Rk*T_force);
-    a_omega_k = (-S_3k*I*omega_k + ta);
+    a_omega_k = inv(I)*(-S_3k*I*omega_k + ta);
 
     Sk = [S_3k, Rk'*vk, Rk'*ak, Rk'*a_omega_k;
           zeros(3,6)];

@@ -1,3 +1,4 @@
+
 clc
 clear all
 import casadi.*
@@ -5,7 +6,7 @@ import casadi.*
 %% =========================================================
 % Horizonte
 %% =========================================================
-N  = 10;
+N  =50;
 dt = 0.01;
 
 v_min = -0.5;
@@ -64,7 +65,7 @@ T_ref = [R_ref(1), -R_ref(2), p_ref(1),v_ref(1);
  R = diag([1,1,1]);
  g = [];
  p_max = 9;
- p_min = -0.1;
+ p_min = -3;
   Matriz_T = reshape(T_hor(:,1), 4, 4);
   Matriz_T0 = reshape(T0, 4, 4);
   H_1 = Matriz_T(1:3,1:3);
@@ -112,7 +113,7 @@ reshape(T_hor(:,k), 4, 4);
 %% =========================================================
 % Simulação em malha fechada (MPC)
 %% =========================================================
-Tsim = 1000; % número de passos
+Tsim = 2000; % número de passos
 
 % Estado inicial real
 T_real = full(T_0);
@@ -124,7 +125,7 @@ T_guess = repmat(full(T_0(:)),1,N+1);
 T_hist = zeros(16,Tsim);
 vf  =[];
 for t = 1:Tsim
-
+tic
     fprintf('Tempo %d\n', t);
 
     %% =====================================================
@@ -136,7 +137,7 @@ for t = 1:Tsim
     end
 
     G_opt = run_optimization( ...
-        sym_data, casadi_funs, G0, T_real(:), 200, 1e-2,0);
+        sym_data, casadi_funs, G0, T_real(:), 200, 1e-3,1, 1e-5);
 
     %% =====================================================
     % Extrair solução ótima
@@ -183,11 +184,16 @@ for t = 1:Tsim
 
     %% =====================================================
     % Shift do horizonte (warm start)
+    
+  
+    
+    
     %% =====================================================
     T_guess(:,1:N) = T_opt(:,2:N+1);
     T_guess(:,N+1) = T_opt(:,N+1);
 
     % IMPORTANTE: atualizar condição inicial
     T_guess(:,1) = T_real(:);
+    toc
 
 end
